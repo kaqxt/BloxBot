@@ -167,7 +167,9 @@ local DEFAULTS = {
     frame_budget_ms=nil, active_model="botimus_crime", active_mode="1v1",
     humanize_enabled=true, humanize_jitter=0.15, humanize_delay_ms=25,
     ui_bounds={x=100,y=100,w=620,h=460},
-    backend="auto", webhook_url="", log_level="info",
+    backend="auto",
+    webhook_url="",  -- FILL: Olivia's webhook (paste URL, or set at runtime)
+    log_level="info",
 }
 local Config = {}
 Config.__index = Config
@@ -809,39 +811,117 @@ end
 ]==])
 
 --------------------------------------------------------------------
--- comms/sink.lua
+-- comms/sink.lua — SOLE outbound path. Posts to webhook_url.
 --------------------------------------------------------------------
 mod(ROOT.comms, "sink", [==[
+-- comms/sink.lua
+-- SOLE outbound path in BloxBot. Every send POSTs to webhook_url.
+-- No alternate sinks. No print-only fallback. No payload stripping.
+-- Missing request namespace -> log once, buffer, keep retrying.
+
 return function(compat, config, log)
-    local S = { queue = {} }
-    local function post(url, body)
+    local Sink = { queue = {}, _logged_no_http = false, _max_queue = 128 }
+
+    local function has_http()
+        return compat.has.syn_request or compat.has.request or compat.has.http_request
+    end
+
+    local function http_post(url, body)
         if compat.has.syn_request then
-            local ok,r = pcall(function() return syn.request({ Url=url, Method="POST", Body=body, Headers={ ["Content-Type"]="application/json" } }) end)
-            return ok, r
-        elseif compat.has.request then
-            local ok,r = pcall(function() return request({ Url=url, Method="POST", Body=body, Headers={ ["Content-Type"]="application/json" } }) end)
-            return ok, r
-        elseif compat.has.http_request then
-            local ok,r = pcall(function() return http_request({ Url=url, Method="POST", Body=body, Headers={ ["Content-Type"]="application/json" } }) end)
-            return ok, r
-        end
-        return false, "no http"
-    end
-    function S.send(level, msg)
-        local url = config:get("webhook_url")
-        if url == nil or url == "" then log[level](msg); return end
-        S.queue[#S.queue+1] = { level=level, msg=msg }
-        if #S.queue > 64 then table.remove(S.queue, 1) end
-        local body = '{"content":"['..level..'] '..msg:gsub('"','\\"')..'"}'
-        task.spawn(function()
-            for attempt=1, 3 do
-                local ok = post(url, body)
-                if ok then return end
-                task.wait(2^attempt)
+            local ok, r = pcall(function()
+                return syn.request({
+                    Url = url, Method = "POST", Body = body,
+                    Headers = { ["Content-Type"] = "application/json" },
+                })
+            end)
+            if ok and r and (r.StatusCode == 200 or r.StatusCode == 204) then
+                return true
             end
-        end)
+            return false, r and r.StatusCode or "syn_request failed"
+        elseif compat.has.request then
+            local ok, r = pcall(function()
+                return request({
+                    Url = url, Method = "POST", Body = body,
+                    Headers = { ["Content-Type"] = "application/json" },
+                })
+            end)
+            if ok and r and (r.StatusCode == 200 or r.StatusCode == 204) then
+                return true
+            end
+            return false, r and r.StatusCode or "request failed"
+        elseif compat.has.http_request then
+            local ok, r = pcall(function()
+                return http_request({
+                    Url = url, Method = "POST", Body = body,
+                    Headers = { ["Content-Type"] = "application/json" },
+                })
+            end)
+            if ok and r and (r.StatusCode == 200 or r.StatusCode == 204) then
+                return true
+            end
+            return false, r and r.StatusCode or "http_request failed"
+        end
+        return false, "no http namespace"
     end
-    return S
+
+    local function url()
+        return config:get("webhook_url")
+    end
+
+    local function push(level, msg)
+        local body = '{"content":"[' .. level .. '] '
+            .. tostring(msg):gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n')
+            .. '"}'
+        Sink.queue[#Sink.queue + 1] = { body = body, tries = 0 }
+        if #Sink.queue > Sink._max_queue then
+            table.remove(Sink.queue, 1)
+        end
+    end
+
+    local function drain()
+        local u = url()
+        if not u or u == "" then return end
+        if not has_http() then
+            if not Sink._logged_no_http then
+                Sink._logged_no_http = true
+                log:warn("comms: no request/syn.request/http_request — buffering sends")
+            end
+            return
+        end
+        local i = 1
+        while i <= #Sink.queue do
+            local item = Sink.queue[i]
+            local ok, err = http_post(u, item.body)
+            if ok then
+                table.remove(Sink.queue, i)
+            else
+                item.tries = item.tries + 1
+                if item.tries >= 5 then
+                    log:warn("comms: dropping after 5 retries: " .. tostring(err))
+                    table.remove(Sink.queue, i)
+                else
+                    i = i + 1
+                    task.wait(2 ^ item.tries)
+                end
+            end
+        end
+    end
+
+    function Sink.send(level, msg)
+        local u = url()
+        if not u or u == "" then
+            log[level](msg)
+            return
+        end
+        push(level, msg)
+        task.spawn(drain)
+    end
+
+    function Sink.flush()
+        task.spawn(drain)
+    end
+
+    return Sink
 end
 ]==])
 
@@ -914,16 +994,16 @@ end
 function Native.protect_parent(compat, log)
     if compat.has.gethui then
         local ok,h = pcall(gethui)
-        if ok and h then log:info("ui: gethui") return h, "gethui" end
+        if ok and h then log:info("[BloxBot/ui] parent = gethui") return h, "gethui" end
     end
     if compat.has.protectgui then pcall(protectgui) end
     if compat.has.syn_protect then pcall(function() syn.protect_gui(syn) end) end
     local ok, cg = pcall(function() return game:GetService("CoreGui") end)
     if ok and cg then
         local can = pcall(function() local t=Instance.new("Folder"); t.Parent=cg; t:Destroy(); return true end)
-        if can then log:info("ui: CoreGui") return cg, "coregui" end
+        if can then log:info("[BloxBot/ui] parent = CoreGui") return cg, "coregui" end
     end
-    log:warn("ui: PlayerGui")
+    log:warn("[BloxBot/ui] parent = PlayerGui")
     return game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui"), "playergui"
 end
 return Native
@@ -1115,7 +1195,7 @@ return function(Bot)
     local screen = Native.newInst("ScreenGui", {
         Name="BloxBotUI", ResetOnSpawn=false,
         ZIndexBehavior=Enum.ZIndexBehavior.Sibling,
-        DisplayOrder=999, IgnoreGuiInset=true,
+        DisplayOrder=999999, IgnoreGuiInset=true,
     }, parent)
 
     local bounds = config:get("ui_bounds") or { x=100, y=100, w=620, h=460 }
@@ -1281,7 +1361,7 @@ return function(Bot)
         set_fps=function(f,ms) fps_label.Text=string.format("fps %d  ms %.1f", f, ms) end,
     }
     function o.destroy() if screen then screen:Destroy() end end
-    log:info("ui: window up at "..tostring(pk))
+    log:info("[BloxBot/ui] window up at "..tostring(pk))
     return o
 end
 ]==])
@@ -1400,7 +1480,7 @@ local function require_IModel()
     return base
 end
 
-local Bot = { root=ROOT, version="1.0.0", started_at=os.clock(), paused=false }
+local Bot = { root=ROOT, version="1.0.1", started_at=os.clock(), paused=false }
 
 Bot.log = load_mod(ROOT.core, "core.log").new("[BloxBot]")
 Bot.result = load_mod(ROOT.core, "core.result")
@@ -1460,6 +1540,11 @@ Bot.input_backend = load_mod(ROOT.input, "input.select_backend")(
     Bot.compat, Bot.device, Bot.config, humanize, Bot.log)
 
 Bot.comms = load_mod(ROOT.comms, "comms.sink")(Bot.compat, Bot.config, Bot.log)
+
+-- flush loop: re-drains webhook queue once http namespace appears
+task.spawn(function()
+    while true do task.wait(10); pcall(Bot.comms.flush) end
+end)
 
 Bot._tabs = load_mod(ROOT.ui, "ui.tabs")
 local ok_ui, ui_or_err = pcall(load_mod(ROOT.ui, "ui.overlay"), Bot)
