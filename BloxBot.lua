@@ -691,4 +691,806 @@ return function(config)
     local H = {}
     function H.delay_ms()
         if not config:get("humanize_enabled") then return 0 end
-        return config:get("humanize_delay_ms") or
+        return config:get("humanize_delay_ms") or 25
+    end
+    function H.wrap(fn)
+        return function(...)
+            local ok, err = pcall(fn, ...)
+            if not ok then return nil, err end
+            if H.delay_ms() > 0 then task.wait(H.delay_ms() / 1000) end
+            return true
+        end
+    end
+    return H
+end
+]==])
+
+--------------------------------------------------------------------
+-- input/virtual_user.lua
+--------------------------------------------------------------------
+mod(ROOT.input, "virtual_user", [==[
+return function(compat, humanize, log)
+    local VU = { name = "virtual_user" }
+    if not compat.has.virtual_user then VU.available = false; return VU end
+    VU.available = true
+    function VU.apply(list)
+        for _, item in ipairs(list) do
+            humanize.wrap(function()
+                if item.jump then
+                    pcall(function() VirtualUser:SendKeyEvent(Enum.KeyCode.Space, true) end)
+                    task.wait(0.05)
+                    pcall(function() VirtualUser:SendKeyEvent(Enum.KeyCode.Space, false) end)
+                end
+                if item.boost then
+                    pcall(function() VirtualUser:SendKeyEvent(Enum.KeyCode.LeftShift, true) end)
+                    task.wait(0.15)
+                    pcall(function() VirtualUser:SendKeyEvent(Enum.KeyCode.LeftShift, false) end)
+                end
+            end)()
+        end
+    end
+    return VU
+end
+]==])
+
+--------------------------------------------------------------------
+-- input/mouse.lua
+--------------------------------------------------------------------
+mod(ROOT.input, "mouse", [==[
+return function(compat, humanize, log)
+    local M = { name = "mouse" }
+    if not (compat.has.mousemoverel and compat.has.keypress) then M.available=false; return M end
+    M.available = true
+    function M.apply(list)
+        for _, item in ipairs(list) do
+            humanize.wrap(function()
+                if item.jump then pcall(function() keypress(0x20) end) end
+                if item.boost then pcall(function() keypress(0x10) end) end
+            end)()
+        end
+    end
+    return M
+end
+]==])
+
+--------------------------------------------------------------------
+-- input/touch.lua
+--------------------------------------------------------------------
+mod(ROOT.input, "touch", [==[
+return function(compat, humanize, log)
+    local T = { name = "touch" }
+    if not compat.has.virtual_user then T.available=false; return T end
+    T.available = true
+    function T.apply(list)
+        for _, item in ipairs(list) do
+            humanize.wrap(function()
+                if item.jump then
+                    pcall(function()
+                        VirtualUser:Button1Down(Vector2.new(0.5, 0.5), workspace.CurrentCamera.CFrame)
+                        task.wait(0.05)
+                        VirtualUser:Button1Up(Vector2.new(0.5, 0.5), workspace.CurrentCamera.CFrame)
+                    end)
+                end
+            end)()
+        end
+    end
+    return T
+end
+]==])
+
+--------------------------------------------------------------------
+-- input/select_backend.lua
+--------------------------------------------------------------------
+mod(ROOT.input, "select_backend", [==[
+return function(compat, device, config, humanize, log)
+    local want = config:get("backend") or "auto"
+    local order
+    if want == "auto" then
+        if device.kind == "mobile" then order = { "touch", "virtual_user", "mouse" }
+        else order = { "virtual_user", "mouse" } end
+    else
+        order = { want }
+    end
+    local maps = {
+        virtual_user = function() return ROOT.input.virtual_user_fn end,
+        mouse        = function() return ROOT.input.mouse_fn end,
+        touch        = function() return ROOT.input.touch_fn end,
+    }
+    for _, name in ipairs(order) do
+        local fac = maps[name] and maps[name]()
+        if fac then
+            local b = fac(compat, humanize, log)
+            if b.available then log:info("input: "..name); return b end
+        end
+    end
+    log:warn("input: no backend — dry-run")
+    return { name="dry_run", available=false, apply=function() end }
+end
+]==])
+
+--------------------------------------------------------------------
+-- comms/sink.lua
+--------------------------------------------------------------------
+mod(ROOT.comms, "sink", [==[
+return function(compat, config, log)
+    local S = { queue = {} }
+    local function post(url, body)
+        if compat.has.syn_request then
+            local ok,r = pcall(function() return syn.request({ Url=url, Method="POST", Body=body, Headers={ ["Content-Type"]="application/json" } }) end)
+            return ok, r
+        elseif compat.has.request then
+            local ok,r = pcall(function() return request({ Url=url, Method="POST", Body=body, Headers={ ["Content-Type"]="application/json" } }) end)
+            return ok, r
+        elseif compat.has.http_request then
+            local ok,r = pcall(function() return http_request({ Url=url, Method="POST", Body=body, Headers={ ["Content-Type"]="application/json" } }) end)
+            return ok, r
+        end
+        return false, "no http"
+    end
+    function S.send(level, msg)
+        local url = config:get("webhook_url")
+        if url == nil or url == "" then log[level](msg); return end
+        S.queue[#S.queue+1] = { level=level, msg=msg }
+        if #S.queue > 64 then table.remove(S.queue, 1) end
+        local body = '{"content":"['..level..'] '..msg:gsub('"','\\"')..'"}'
+        task.spawn(function()
+            for attempt=1, 3 do
+                local ok = post(url, body)
+                if ok then return end
+                task.wait(2^attempt)
+            end
+        end)
+    end
+    return S
+end
+]==])
+
+--------------------------------------------------------------------
+-- ui/theme.lua
+--------------------------------------------------------------------
+mod(ROOT.ui, "theme", [==[
+local THEMES = {
+    dark = { bg=Color3.fromRGB(18,18,22), surface=Color3.fromRGB(28,28,34),
+        surfaceHi=Color3.fromRGB(38,38,46), stroke=Color3.fromRGB(58,58,68),
+        text=Color3.fromRGB(236,236,240), textDim=Color3.fromRGB(150,150,160),
+        accent=Color3.fromRGB(120,170,255), accent2=Color3.fromRGB(255,110,180),
+        ok=Color3.fromRGB(120,220,140), warn=Color3.fromRGB(255,190,90),
+        err=Color3.fromRGB(255,100,100) },
+    light = { bg=Color3.fromRGB(245,245,250), surface=Color3.fromRGB(255,255,255),
+        surfaceHi=Color3.fromRGB(235,235,240), stroke=Color3.fromRGB(200,200,210),
+        text=Color3.fromRGB(24,24,30), textDim=Color3.fromRGB(100,100,110),
+        accent=Color3.fromRGB(60,120,240), accent2=Color3.fromRGB(220,60,140),
+        ok=Color3.fromRGB(60,180,90), warn=Color3.fromRGB(230,160,40),
+        err=Color3.fromRGB(220,60,60) },
+}
+local M = {
+    FONT_HEAD=Enum.Font.GothamBold, FONT_BODY=Enum.Font.Gotham,
+    CORNER_PANEL=UDim.new(0,8), CORNER_BUTTON=UDim.new(0,6),
+    STROKE_WIDTH=1, STROKE_TRANSPARENCY=0.4, TWEEN_FAST=0.18,
+    EASE=Enum.EasingStyle.Quad, EASE_DIR=Enum.EasingDirection.Out,
+    _mode="dark",
+}
+function M.set_mode(n) if THEMES[n] then M._mode=n end end
+function M.mode() return M._mode end
+function M.tokens() return THEMES[M._mode] end
+return M
+]==])
+
+--------------------------------------------------------------------
+-- ui/vendor/native.lua
+--------------------------------------------------------------------
+mod(ROOT.ui_vendor, "native", [==[
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+local Native = {}
+local function newInst(cls, props, parent)
+    local inst = Instance.new(cls)
+    for k,v in pairs(props or {}) do inst[k]=v end
+    if parent then inst.Parent=parent end
+    return inst
+end
+Native.newInst = newInst
+function Native.corner(inst, r) return newInst("UICorner", { CornerRadius=r }, inst) end
+function Native.stroke(inst, c, t, w) return newInst("UIStroke", { Color=c, Transparency=t, Thickness=w }, inst) end
+function Native.padding(inst, px) return newInst("UIPadding", {
+    PaddingTop=UDim.new(0,px), PaddingBottom=UDim.new(0,px),
+    PaddingLeft=UDim.new(0,px), PaddingRight=UDim.new(0,px) }, inst) end
+function Native.floating_button(parent, theme, onClick)
+    local btn = newInst("TextButton", {
+        Size=UDim2.fromOffset(48,48), Position=UDim2.new(1,-64,0.5,-24),
+        BackgroundColor3=theme.accent, Text="B", TextColor3=theme.bg,
+        Font=Enum.Font.GothamBold, TextSize=20, AutoButtonColor=false,
+        AnchorPoint=Vector2.new(0,0), BorderSizePixel=0,
+    }, parent)
+    Native.corner(btn, UDim.new(0.5,0))
+    btn.MouseButton1Click:Connect(onClick)
+    if UIS.TouchEnabled then
+        btn.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Touch then onClick() end
+        end)
+    end
+    return btn
+end
+function Native.protect_parent(compat, log)
+    if compat.has.gethui then
+        local ok,h = pcall(gethui)
+        if ok and h then log:info("ui: gethui") return h, "gethui" end
+    end
+    if compat.has.protectgui then pcall(protectgui) end
+    if compat.has.syn_protect then pcall(function() syn.protect_gui(syn) end) end
+    local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+    if ok and cg then
+        local can = pcall(function() local t=Instance.new("Folder"); t.Parent=cg; t:Destroy(); return true end)
+        if can then log:info("ui: CoreGui") return cg, "coregui" end
+    end
+    log:warn("ui: PlayerGui")
+    return game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui"), "playergui"
+end
+return Native
+]==])
+
+--------------------------------------------------------------------
+-- ui/tabs.lua
+--------------------------------------------------------------------
+mod(ROOT.ui, "tabs", [==[
+return function(ctx)
+    local T = ctx.theme.tokens()
+    local N = ctx.native
+    local tabs = {}
+    local function clear() if ctx.content_holder then ctx.content_holder:Destroy() end end
+    local function page()
+        local h = N.newInst("ScrollingFrame", {
+            Name="Page", Size=UDim2.new(1,0,1,0),
+            BackgroundTransparency=1, BorderSizePixel=0,
+            ScrollBarThickness=4, CanvasSize=UDim2.new(0,0,0,0),
+            AutomaticCanvasSize=Enum.AutomaticSize.Y,
+        }, ctx.body)
+        N.padding(h, 12); ctx.content_holder = h; return h
+    end
+
+    tabs.models = function()
+        clear(); local p = page()
+        local reg = ctx.Bot.registry
+        local y = 0
+        local modes = { "1v1", "2v2", "3v3" }
+        for _, mode in ipairs(modes) do
+            N.newInst("TextLabel", {
+                Text=mode, Font=ctx.theme.FONT_HEAD, TextSize=14,
+                TextColor3=T.accent, BackgroundTransparency=1,
+                Size=UDim2.new(1,0,0,24), Position=UDim2.new(0,0,0,y),
+                TextXAlignment=Enum.TextXAlignment.Left,
+            }, p)
+            y = y + 28
+            for name in pairs(reg) do
+                local active = ctx.Bot.config:get("active_model") == name
+                local row = N.newInst("TextButton", {
+                    Text="  "..name.."  —  "..(active and "● active" or "○"),
+                    Font=ctx.theme.FONT_BODY, TextSize=13, TextColor3=T.text,
+                    BackgroundColor3=T.surface, Size=UDim2.new(1,0,0,36),
+                    Position=UDim2.new(0,0,0,y),
+                    TextXAlignment=Enum.TextXAlignment.Left,
+                    BorderSizePixel=0, AutoButtonColor=false,
+                }, p)
+                N.corner(row, ctx.theme.CORNER_BUTTON)
+                N.stroke(row, T.stroke, 0.4, 1)
+                row.MouseButton1Click:Connect(function()
+                    ctx.Bot.config:set("active_model", name)
+                    ctx.Bot.active_model = reg[name]
+                    tabs.models()
+                end)
+                y = y + 40
+            end
+        end
+        p.CanvasSize = UDim2.new(0,0,0,y+20)
+    end
+
+    tabs.mechanics = function()
+        clear(); local p = page()
+        local y = 0
+        for name in pairs(ctx.Bot.mechanics) do
+            N.newInst("TextLabel", {
+                Text=name, Font=ctx.theme.FONT_HEAD, TextSize=13,
+                TextColor3=T.text, BackgroundTransparency=1,
+                Size=UDim2.new(1,0,0,28), Position=UDim2.new(0,0,0,y),
+                TextXAlignment=Enum.TextXAlignment.Left,
+            }, p)
+            y = y + 32
+        end
+        p.CanvasSize = UDim2.new(0,0,0,y+20)
+    end
+
+    tabs.game = function()
+        clear(); local p = page()
+        local report = ctx.Bot.reader.report()
+        N.newInst("TextLabel", {
+            Text="reader status\n\n"..report, Font=ctx.theme.FONT_BODY,
+            TextSize=13, TextColor3=T.textDim, BackgroundTransparency=1,
+            Size=UDim2.new(1,0,0,200), Position=UDim2.new(0,0,0,0),
+            TextXAlignment=Enum.TextXAlignment.Left,
+            TextYAlignment=Enum.TextYAlignment.Top, TextWrapped=true,
+        }, p)
+        local btn = N.newInst("TextButton", {
+            Text="Refresh", Font=ctx.theme.FONT_HEAD, TextSize=13,
+            TextColor3=T.bg, BackgroundColor3=T.accent,
+            Size=UDim2.fromOffset(100,32), Position=UDim2.new(0,0,0,220),
+            BorderSizePixel=0, AutoButtonColor=false,
+        }, p)
+        N.corner(btn, ctx.theme.CORNER_BUTTON)
+        btn.MouseButton1Click:Connect(function() tabs.game() end)
+        p.CanvasSize = UDim2.new(0,0,0,280)
+    end
+
+    tabs.input = function()
+        clear(); local p = page()
+        local backend = ctx.Bot.input_backend
+        N.newInst("TextLabel", {
+            Text="backend: "..(backend and backend.name or "none")
+                ..(backend and backend.available and " (available)" or " (unavailable)"),
+            Font=ctx.theme.FONT_BODY, TextSize=13, TextColor3=T.text,
+            BackgroundTransparency=1, Size=UDim2.new(1,0,0,28),
+            Position=UDim2.new(0,0,0,0), TextXAlignment=Enum.TextXAlignment.Left,
+        }, p)
+        local y = 40
+        for _, opt in ipairs({ "auto", "virtual_user", "mouse", "touch" }) do
+            local row = N.newInst("TextButton", {
+                Text="  "..opt..(ctx.Bot.config:get("backend")==opt and "  ●" or ""),
+                Font=ctx.theme.FONT_BODY, TextSize=13, TextColor3=T.text,
+                BackgroundColor3=T.surface, Size=UDim2.new(1,0,0,32),
+                Position=UDim2.new(0,0,0,y),
+                TextXAlignment=Enum.TextXAlignment.Left,
+                BorderSizePixel=0, AutoButtonColor=false,
+            }, p)
+            N.corner(row, ctx.theme.CORNER_BUTTON)
+            N.stroke(row, T.stroke, 0.4, 1)
+            row.MouseButton1Click:Connect(function()
+                ctx.Bot.config:set("backend", opt); tabs.input()
+            end)
+            y = y + 36
+        end
+        p.CanvasSize = UDim2.new(0,0,0,y+20)
+    end
+
+    tabs.config = function()
+        clear(); local p = page()
+        local y = 0
+        local function row(label, value, on_click)
+            local btn = N.newInst("TextButton", {
+                Text="  "..label.." : "..tostring(value),
+                Font=ctx.theme.FONT_BODY, TextSize=13, TextColor3=T.text,
+                BackgroundColor3=T.surface, Size=UDim2.new(1,0,0,32),
+                Position=UDim2.new(0,0,0,y),
+                TextXAlignment=Enum.TextXAlignment.Left,
+                BorderSizePixel=0, AutoButtonColor=false,
+            }, p)
+            N.corner(btn, ctx.theme.CORNER_BUTTON)
+            N.stroke(btn, T.stroke, 0.4, 1)
+            if on_click then btn.MouseButton1Click:Connect(on_click) end
+            y = y + 36
+        end
+        row("theme", ctx.Bot.config:get("theme"), function()
+            local cur = ctx.Bot.config:get("theme")
+            local nxt = cur == "dark" and "light" or "dark"
+            ctx.Bot.config:set("theme", nxt); ctx.Bot.theme.set_mode(nxt)
+            tabs.config()
+        end)
+        row("save config", "click", function() ctx.Bot.config:save() end)
+        row("load config", "click", function() ctx.Bot.config:load() end)
+        row("reset defaults", "click", function() ctx.Bot.config:reset(); tabs.config() end)
+        row("compat check", "click", function()
+            print("=== BloxBot compat ===\n"..ctx.Bot.compat.report())
+        end)
+        if not ctx.Bot.compat.supports("fileio") then
+            N.newInst("TextLabel", {
+                Text="session-only config (no filesystem)",
+                Font=ctx.theme.FONT_BODY, TextSize=12, TextColor3=T.warn,
+                BackgroundTransparency=1, Size=UDim2.new(1,0,0,20),
+                Position=UDim2.new(0,0,0,y),
+                TextXAlignment=Enum.TextXAlignment.Left,
+            }, p)
+            y = y + 24
+        end
+        p.CanvasSize = UDim2.new(0,0,0,y+20)
+    end
+
+    return tabs
+end
+]==])
+
+--------------------------------------------------------------------
+-- ui/overlay.lua
+--------------------------------------------------------------------
+mod(ROOT.ui, "overlay", [==[
+local TweenService = game:GetService("TweenService")
+local UIS = game:GetService("UserInputService")
+return function(Bot)
+    local theme = Bot.theme
+    local log = Bot.log
+    local compat = Bot.compat
+    local config = Bot.config
+    local device = Bot.device
+    local Native = Bot._native
+    local T = theme.tokens()
+
+    local parent, pk = Native.protect_parent(compat, log)
+    local screen = Native.newInst("ScreenGui", {
+        Name="BloxBotUI", ResetOnSpawn=false,
+        ZIndexBehavior=Enum.ZIndexBehavior.Sibling,
+        DisplayOrder=999, IgnoreGuiInset=true,
+    }, parent)
+
+    local bounds = config:get("ui_bounds") or { x=100, y=100, w=620, h=460 }
+    local function clamp(w,h)
+        local cam = workspace.CurrentCamera
+        local vp = cam and cam.ViewportSize or Vector2.new(1280,720)
+        w = math.min(w, math.floor(vp.X*0.92))
+        h = math.min(h, math.floor(vp.Y*0.92))
+        if device.kind=="mobile" then w=math.max(w,320); h=math.max(h,400) end
+        return w,h
+    end
+    bounds.w, bounds.h = clamp(bounds.w, bounds.h)
+
+    local window = Native.newInst("Frame", {
+        Name="Window", Size=UDim2.fromOffset(bounds.w, bounds.h),
+        Position=UDim2.fromOffset(bounds.x, bounds.y),
+        BackgroundColor3=T.bg, BorderSizePixel=0,
+        ClipsDescendants=true, Active=true,
+    }, screen)
+    Native.corner(window, theme.CORNER_PANEL)
+    Native.stroke(window, T.stroke, theme.STROKE_TRANSPARENCY, theme.STROKE_WIDTH)
+
+    local topbar = Native.newInst("Frame", {
+        Name="TopBar", Size=UDim2.new(1,0,0,40),
+        BackgroundColor3=T.surface, BorderSizePixel=0,
+    }, window)
+    Native.corner(topbar, theme.CORNER_PANEL)
+
+    Native.newInst("TextLabel", {
+        Text="BloxBot", Font=theme.FONT_HEAD, TextSize=16,
+        TextColor3=T.text, BackgroundTransparency=1,
+        Position=UDim2.fromOffset(12,0), Size=UDim2.new(0,120,1,0),
+        TextXAlignment=Enum.TextXAlignment.Left,
+    }, topbar)
+    Native.newInst("TextLabel", {
+        Text="v"..Bot.version, Font=theme.FONT_BODY, TextSize=12,
+        TextColor3=T.textDim, BackgroundTransparency=1,
+        Position=UDim2.fromOffset(88,0), Size=UDim2.new(0,160,1,0),
+        TextXAlignment=Enum.TextXAlignment.Left,
+    }, topbar)
+    local minBtn = Native.newInst("TextButton", {
+        Text="—", Font=theme.FONT_HEAD, TextSize=16, TextColor3=T.text,
+        BackgroundColor3=T.surfaceHi, Size=UDim2.new(0,32,0,32),
+        Position=UDim2.new(1,-76,0.5,-16), BorderSizePixel=0, AutoButtonColor=false,
+    }, topbar)
+    Native.corner(minBtn, theme.CORNER_BUTTON)
+    local closeBtn = Native.newInst("TextButton", {
+        Text="×", Font=theme.FONT_HEAD, TextSize=18, TextColor3=T.err,
+        BackgroundColor3=T.surfaceHi, Size=UDim2.new(0,32,0,32),
+        Position=UDim2.new(1,-38,0.5,-16), BorderSizePixel=0, AutoButtonColor=false,
+    }, topbar)
+    Native.corner(closeBtn, theme.CORNER_BUTTON)
+
+    local compact = device.kind=="mobile" or device.short_side < 720
+    local rail_w = compact and 56 or 140
+    local rail = Native.newInst("Frame", {
+        Name="Rail", Size=UDim2.new(0,rail_w,1,-68),
+        Position=UDim2.fromOffset(0,40), BackgroundColor3=T.surface,
+        BorderSizePixel=0,
+    }, window)
+    local tabs_frame = Native.newInst("Frame", {
+        Name="Tabs", Size=UDim2.new(1,-rail_w,1,-68),
+        Position=UDim2.fromOffset(rail_w,40), BackgroundColor3=T.bg,
+        BorderSizePixel=0,
+    }, window)
+    local bottombar = Native.newInst("Frame", {
+        Name="BottomBar", Size=UDim2.new(1,0,0,28),
+        Position=UDim2.new(0,0,1,-28), BackgroundColor3=T.surface,
+        BorderSizePixel=0,
+    }, window)
+    local status_pill = Native.newInst("TextLabel", {
+        Text="  idle  ", Font=theme.FONT_BODY, TextSize=12,
+        TextColor3=T.text, BackgroundColor3=T.surfaceHi,
+        Size=UDim2.fromOffset(64,20), Position=UDim2.new(1,-132,0.5,-10),
+        BorderSizePixel=0,
+    }, bottombar)
+    Native.corner(status_pill, UDim.new(0,10))
+    local fps_label = Native.newInst("TextLabel", {
+        Text="fps --  ms --", Font=theme.FONT_BODY, TextSize=11,
+        TextColor3=T.textDim, BackgroundTransparency=1,
+        Size=UDim2.fromOffset(120,20), Position=UDim2.new(1,-256,0.5,-10),
+        TextXAlignment=Enum.TextXAlignment.Right,
+    }, bottombar)
+
+    local ctx = { theme=theme, native=Native, body=tabs_frame, config=config, Bot=Bot }
+    local tabs = Bot._tabs(ctx)
+    local order = { "models", "mechanics", "game", "input", "config" }
+    local btns = {}
+    local function select(name)
+        for n,b in pairs(btns) do
+            b.BackgroundColor3 = (n==name) and T.surfaceHi or T.surface
+        end
+        if tabs[name] then tabs[name]() end
+    end
+    for i, name in ipairs(order) do
+        local b = Native.newInst("TextButton", {
+            Text = compact and name:sub(1,1):upper() or ("  "..name),
+            Font=theme.FONT_BODY, TextSize=13, TextColor3=T.text,
+            BackgroundColor3=T.surface, Size=UDim2.new(1,0,0,36),
+            Position=UDim2.new(0,0,0,(i-1)*40),
+            TextXAlignment = compact and Enum.TextXAlignment.Center or Enum.TextXAlignment.Left,
+            BorderSizePixel=0, AutoButtonColor=false,
+        }, rail)
+        b.MouseButton1Click:Connect(function() select(name) end)
+        btns[name] = b
+    end
+    select("models")
+
+    local dragging, dragStart, startPos
+    topbar.InputBegan:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1
+            or input.UserInputType==Enum.UserInputType.Touch then
+            dragging=true; dragStart=input.Position; startPos=window.Position
+            input.Changed:Connect(function()
+                if input.UserInputState==Enum.UserInputState.End then dragging=false end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType==Enum.UserInputType.MouseMovement
+            or input.UserInputType==Enum.UserInputType.Touch then
+            local d = input.Position - dragStart
+            window.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                                        startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if (input.UserInputType==Enum.UserInputType.MouseButton1
+            or input.UserInputType==Enum.UserInputType.Touch) and dragging then
+            dragging = false
+            local pos, size = window.Position, window.Size
+            config:set("ui_bounds", {
+                x=pos.X.Offset, y=pos.Y.Offset, w=size.X.Offset, h=size.Y.Offset })
+        end
+    end)
+
+    window.BackgroundTransparency = 1
+    TweenService:Create(window, TweenInfo.new(0.15, theme.EASE, theme.EASE_DIR),
+        { BackgroundTransparency = 0 }):Play()
+
+    local floating_btn
+    local function hide()
+        window.Visible = false
+        if device.kind=="mobile" and not floating_btn then
+            floating_btn = Native.floating_button(screen, T, function()
+                window.Visible = true
+                if floating_btn then floating_btn:Destroy(); floating_btn=nil end
+            end)
+        end
+    end
+    local function show()
+        window.Visible = true
+        if floating_btn then floating_btn:Destroy(); floating_btn=nil end
+    end
+    minBtn.MouseButton1Click:Connect(hide)
+    closeBtn.MouseButton1Click:Connect(hide)
+
+    local o = {
+        screen=screen, window=window, parent_kind=pk,
+        show=show, hide=hide,
+        set_status=function(t) status_pill.Text="  "..t.."  " end,
+        set_fps=function(f,ms) fps_label.Text=string.format("fps %d  ms %.1f", f, ms) end,
+    }
+    function o.destroy() if screen then screen:Destroy() end end
+    log:info("ui: window up at "..tostring(pk))
+    return o
+end
+]==])
+
+--------------------------------------------------------------------
+-- ui/hotkeys.lua
+--------------------------------------------------------------------
+mod(ROOT.ui, "hotkeys", [==[
+return function(Bot)
+    local UIS = game:GetService("UserInputService")
+    local conns = {}
+    conns[#conns+1] = UIS.InputBegan:Connect(function(input, processed)
+        if processed then return end
+        if input.KeyCode == Enum.KeyCode.RightShift then
+            if Bot.ui then
+                if Bot.ui.window and Bot.ui.window.Visible then Bot.ui.hide() else Bot.ui.show() end
+            end
+        elseif input.KeyCode == Enum.KeyCode.RightControl then
+            Bot.paused = not Bot.paused
+            if Bot.ui and Bot.ui.set_status then
+                Bot.ui.set_status(Bot.paused and "paused" or "running")
+            end
+        elseif input.KeyCode == Enum.KeyCode.End then
+            if Bot.heartbeat then Bot.heartbeat:stop() end
+            if Bot.ui then Bot.ui.hide() end
+        end
+    end)
+    return { destroy = function() for _,c in ipairs(conns) do pcall(function() c:Disconnect() end) end end }
+end
+]==])
+
+--------------------------------------------------------------------
+-- core/heartbeat.lua
+--------------------------------------------------------------------
+mod(ROOT.core, "heartbeat", [==[
+local RunService = game:GetService("RunService")
+return function(Bot)
+    local hb = { running=false, overrun_streak=0 }
+    local conn
+    local function tick(dt)
+        if not hb.running or Bot.paused then return end
+        local t0 = os.clock()
+        local budget = (Bot.config and Bot.config:get("frame_budget_ms") or 1.0) / 1000
+        local ok, err = pcall(function()
+            local gs = Bot.game_state.compose()
+            local model = Bot.active_model
+            if model then
+                local it = Bot.intent
+                it:clear()
+                model:on_tick(gs, it)
+                local d = it:drain()
+                if d and #d > 0 and Bot.input_backend and Bot.input_backend.apply then
+                    Bot.input_backend.apply(d)
+                end
+            end
+        end)
+        if not ok then
+            hb.overrun_streak = 0
+            if Bot.log then Bot.log:error("tick: "..tostring(err)) end
+        end
+        local spent = os.clock() - t0
+        if spent > budget then
+            hb.overrun_streak = hb.overrun_streak + 1
+            if hb.overrun_streak > 20 and Bot.log then
+                Bot.log:warn("heartbeat overrun x"..hb.overrun_streak)
+                hb.overrun_streak = 0
+            end
+        else hb.overrun_streak = 0 end
+        if Bot.ui and Bot.ui.set_fps then
+            hb._f = (hb._f or 0) + 1
+            if not hb._lt or os.clock() - hb._lt > 1 then
+                local fps = hb._f; hb._f = 0; hb._lt = os.clock()
+                Bot.ui.set_fps(fps, spent * 1000)
+            end
+        end
+    end
+    function hb:start()
+        if self.running then return end
+        self.running = true
+        conn = RunService.Heartbeat:Connect(tick)
+    end
+    function hb:stop()
+        self.running = false
+        if conn then conn:Disconnect(); conn = nil end
+    end
+    return hb
+end
+]==])
+
+--------------------------------------------------------------------
+-- BOOT
+--------------------------------------------------------------------
+local env = (getgenv and getgenv()) or _G
+if env.BloxBot and type(env.BloxBot.destroy) == "function" then
+    pcall(env.BloxBot.destroy, env.BloxBot)
+end
+
+local function load_mod(inst, label)
+    if type(inst) ~= "table" or type(inst.Source) ~= "string" then
+        error("BloxBot: missing module " .. label)
+    end
+    local fn, err = loadstring(inst.Source, label)
+    if not fn then error("BloxBot: load " .. label .. ": " .. tostring(err)) end
+    local ok, m = pcall(fn)
+    if not ok then error("BloxBot: run " .. label .. ": " .. tostring(m)) end
+    return m
+end
+
+load_mod(ROOT.models, "models.IModel")
+local function require_IModel()
+    local base = {}; base.__index = base
+    function base.new(opts) return setmetatable({ opts = opts or {} }, base) end
+    function base:name() return "" end
+    function base:on_tick() end
+    function base:reset() end
+    return base
+end
+
+local Bot = { root=ROOT, version="1.0.0", started_at=os.clock(), paused=false }
+
+Bot.log = load_mod(ROOT.core, "core.log").new("[BloxBot]")
+Bot.result = load_mod(ROOT.core, "core.result")
+Bot.compat = load_mod(ROOT.core, "core.compat")
+
+local Config = load_mod(ROOT.core, "core.config")
+Bot.config = Config.new(Bot.compat, { frame_budget_ms=1.0 }, Bot.log)
+Bot.device = load_mod(ROOT.core, "core.device")(Bot.compat, Bot.config)
+Bot.config = Config.new(Bot.compat, Bot.device, Bot.log)
+
+if Bot.compat.supports("fileio") then
+    pcall(function()
+        local p = "BloxBot/config.json"
+        if isfile and isfile(p) then Bot.config:load(p) end
+    end)
+end
+
+Bot.theme = load_mod(ROOT.ui, "ui.theme")
+Bot.theme.set_mode(Bot.config:get("theme") or "dark")
+Bot._native = load_mod(ROOT.ui_vendor, "ui.vendor.native")
+
+local constants = load_mod(ROOT.game, "game.constants")
+Bot.constants = constants
+Bot.reader = load_mod(ROOT.game, "game.reader")(constants, Bot.compat, Bot.log)
+Bot.game_state = load_mod(ROOT.game, "game.state")(Bot.reader, constants, Bot.log)
+
+local mech = {}
+for _, n in ipairs({ "aerial","air_dribble","flip_reset","musty_flick",
+    "triple_pop","pogo","preflip","demo_chase" }) do
+    mech[n] = load_mod(ROOT.mechanics, "mechanics."..n)
+end
+Bot.mechanics = mech
+
+local models = {}
+for _, n in ipairs({ "botimus_crime","nyx","wolvot_v1","wolvot_v31",
+    "wolvot_v4","nox","ripple","mechanoid","classybot","galaxybot",
+    "chorusfruit","yukan_velo","buttbot","bliss","yogie" }) do
+    local src = ROOT.models[n].Source
+    local chunk, err = loadstring("local require_IModel = ... ;\n"..src, "models."..n)
+    if not chunk then error("model load "..n..": "..tostring(err)) end
+    local ok, m = pcall(chunk, require_IModel)
+    if not ok then error("model run "..n..": "..tostring(m)) end
+    models[n] = m
+end
+Bot.registry = load_mod(ROOT.models, "models.registry")(models, mech, Bot.log)
+local active_name = Bot.config:get("active_model") or "botimus_crime"
+Bot.active_model = Bot.registry[active_name]
+
+local Intent = load_mod(ROOT.input, "input.intent")
+Bot.intent = Intent.new()
+local humanize = load_mod(ROOT.input, "input.humanize")(Bot.config)
+Bot.humanize = humanize
+ROOT.input.virtual_user_fn = load_mod(ROOT.input, "input.virtual_user")
+ROOT.input.mouse_fn = load_mod(ROOT.input, "input.mouse")
+ROOT.input.touch_fn = load_mod(ROOT.input, "input.touch")
+Bot.input_backend = load_mod(ROOT.input, "input.select_backend")(
+    Bot.compat, Bot.device, Bot.config, humanize, Bot.log)
+
+Bot.comms = load_mod(ROOT.comms, "comms.sink")(Bot.compat, Bot.config, Bot.log)
+
+Bot._tabs = load_mod(ROOT.ui, "ui.tabs")
+local ok_ui, ui_or_err = pcall(load_mod(ROOT.ui, "ui.overlay"), Bot)
+if not ok_ui then error("BloxBot: ui overlay: "..tostring(ui_or_err)) end
+Bot.ui = ui_or_err
+if not Bot.device.touch then
+    pcall(function() Bot.hotkeys = load_mod(ROOT.ui, "ui.hotkeys")(Bot) end)
+end
+Bot.ui.set_status("running")
+
+Bot.heartbeat = load_mod(ROOT.core, "core.heartbeat")(Bot)
+Bot.heartbeat:start()
+
+function Bot:destroy()
+    if self.heartbeat then pcall(function() self.heartbeat:stop() end) end
+    if self.hotkeys and self.hotkeys.destroy then pcall(self.hotkeys.destroy) end
+    if self.ui and self.ui.destroy then pcall(self.ui.destroy, self.ui) end
+end
+
+local function cleanup_fn()
+    if Bot and Bot.destroy then pcall(Bot.destroy, Bot) end
+end
+if Bot.compat.has.queue_on_teleport then
+    pcall(queue_on_teleport, cleanup_fn)
+else
+    local be = Instance.new("BindableEvent")
+    be.Event:Connect(cleanup_fn)
+    Bot._cleanup_bindable = be
+end
+
+env.BloxBot = Bot
+Bot.log:info("boot complete — BloxBot "..Bot.version
+    .." on "..Bot.compat.executor_name.." ("..Bot.device.kind..")")
+return Bot
